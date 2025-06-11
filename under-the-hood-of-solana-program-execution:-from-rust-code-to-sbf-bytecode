@@ -1,0 +1,441 @@
+# Under the Hood of Solana Program Execution: From Rust Code to SBF Bytecode
+
+
+Solana’s programming model lets developers write high-level Rust code that runs as *on-chain programs*. But what actually happens under the hood—from the moment you write Rust code to the point it executes on Solana’s runtime? This article takes a deep dive into the **Solana development lifecycle** and the **technical internals** of program compilation and execution. 
+
+We’ll start with a high-level overview and gradually drill down into the compilation pipeline, the Solana Bytecode Format (SBF), the runtime’s BPF (Berkeley Packet Filter) virtual machine (VM), and the security mechanics at play.
+
+Along the way, we’ll compare Solana’s approach to the more familiar EVM (Ethereum Virtual Machine) model to help build intuition.
+
+## Overview: Solana Program Development Lifecycle
+
+Solana programs (smart contracts) are deployed to specific on-chain accounts that hold the program’s compiled executable code. Unlike Ethereum where contract code and state live under the same account, Solana clearly separates *code* and *state*. A Solana program is **stateless** by itself (it has no long-lived memory between invocations), but it can manipulate state stored in other accounts that it has access to. Key points in the lifecycle include:
+
+```mermaid
+flowchart TD
+    A["<b>Write</b><br><small>Developer writes Rust code</small>"]
+    B["<b>Compile</b><br><small>Rust to LLVM IR to BPF/SBF bytecode via LLVM backend</small>"]
+    C["<b>Package</b><br><small>Bytecode and metadata packed into ELF</small>"]
+    D["<b>Deploy</b><br><small>ELF uploaded to Solana Program Account via BPF Loader</small>"]
+    E["<b>Finalize</b><br><small>Loader verifies and marks account executable</small>"]
+    F["<b>Execute</b><br><small>User sends tx; runtime loads bytecode into BPF VM and executes</small>"]
+
+    A --> B --> C --> D --> E --> F
+```
+
+### Writing the Program:
+Developers typically write Solana programs in Rust (often using the Solana SDK or frameworks like Anchor). The program is structured as a library crate with an entrypoint function (such as `process_instruction`) that the runtime will call when the program is invoked.
+    
+### Building to BPF Bytecode: 
+Instead of producing native machine code, Solana programs are compiled to a **BPF bytecode** format. Using Solana’s tooling (the deprecated `cargo build-bpf` or the newer `cargo build-sbf`), your Rust code is compiled via LLVM into an **Executable and Linkable Format (ELF)** containing BPF bytecode. This special bytecode is what runs on Solana’s BPF virtual machine.
+    
+### Deploying On-Chain:
+Deployment means uploading the compiled program (the ELF containing SBF bytecode) into a designated *program account* on the blockchain. The Solana runtime provides a *BPF loader* program that handles deployment: the compiled ELF is broken into chunks and written into the account’s data via a series of `Write` instructions, then finalized. 
+    
+Once finalized and verified, the account is marked **executable**. From that point on, Solana nodes recognize this account as a program: any transaction targeting it will execute the contained code. See [load_upgradeable_buffer](https://github.com/anza-xyz/agave/blob/8363752bd5e41aaf8eaf9137711e8d8b11d84be6/runtime/src/loader_utils.rs#L68-L120).
+    
+### Executing the Program: 
+To call a Solana program, a transaction includes an **instruction** specifying the program’s account and a list of other accounts that the program can read or modify. When the Solana runtime processes such a transaction, it sees the targeted program account, loads the bytecode, and invokes the program’s entrypoint in a secure BPF virtual machine instance. 
+    
+The runtime takes care of **serializing inputs** (program ID, accounts, instruction data) into the program’s memory, then jumps to the entrypoint. The program executes (subject to compute limits and security checks) and returns a result or error, after which the runtime writes back any changes to account data.
+    
+See [execute](https://github.com/anza-xyz/agave/blob/8363752bd5e41aaf8eaf9137711e8d8b11d84be6/programs/bpf_loader/src/lib.rs#L1522-L1690).
+
+### Upgradability:
+
+By default, Solana programs can be deployed as *upgradeable*. In this case, the program’s data is stored in a separate buffer account controlled by a **BPF Upgradeable Loader** program. An upgrade authority may replace the program’s code by writing a new ELF to that buffer. 
+
+If the upgrade authority is set to `None`, the program becomes immutable. (For simplicity, we’ll focus on the runtime mechanics common to both upgradeable and immutable programs.)
+
+With this high-level flow in mind, let’s zoom in on each stage of the pipeline—starting from how your Rust source code is transformed into Solana bytecode.
+
+## Compilation Pipeline: From Rust to LLVM IR to SBF
+
+### LLVM Overview:
+```mermaid
+flowchart LR
+    subgraph Frontend
+        C(C language) --> Clang(Clang)
+        Cpp(C++) --> Clang
+        Go(Go) --> Gollvm(Gollvm)
+        Rust(Rust) --> Rustc(rustc)
+    end
+
+    Clang --> IR1[LLVM IR]
+    Gollvm --> IR1
+    Rustc --> IR1
+
+    subgraph Middleend
+        Optimizer(LLVM Optimizer)
+    end
+    IR1 --> Optimizer
+    Optimizer --> IR2[Optimized LLVM IR]
+
+    subgraph Backend
+        StaticCompiler(LLVM Backend)
+    end
+    IR2 --> StaticCompiler
+
+    StaticCompiler --> x86(x86)
+    StaticCompiler --> ARM(ARM)
+    StaticCompiler --> RISCV(RISC-V)
+    StaticCompiler --> BPF[BPF - eBPF / SBF]
+    StaticCompiler --> WASM[WebAssembly]
+    StaticCompiler --> More(...)
+```
+
+In LLVM, the compilation process is divided into three main parts: frontend, middle-end, and backend. The frontend takes code written in languages like C, C++, Go, or Rust and converts it into a common format called Intermediate Representation (IR). 
+
+IR is a simple, platform-independent version of the code that keeps the structure and meaning of the program but makes it easier for the compiler to work with and optimize. It acts as a bridge between the original code and the final machine code.
+
+Once the code is in IR form, it goes through the middle-end, where LLVM applies optimizations to make it faster and more efficient. After that, the backend translates the optimized IR into machine code for different hardware platforms like x86, ARM, RISC-V, BPF (used in Linux and Solana), or WebAssembly. This setup allows LLVM to handle many programming languages and target many different systems in a unified way.
+
+
+### Solana Program Compilation Pipeline
+
+Solana leverages the **LLVM compiler infrastructure** to produce its on-chain bytecode. In fact, Solana’s low-level execution environment is built on the same technology as **eBPF (Extended Berkeley Packet Filter)**, a sandboxed bytecode originally used in the Linux kernel.
+
+
+The journey from Rust source to Solana-ready binary goes through these steps:
+
+```mermaid
+flowchart LR
+  %% ─────────────────────────────
+  %%  Compilation Pipeline (safe)
+  %% ─────────────────────────────
+  subgraph Compilation_Pipeline
+    A[Rust Source<br>lib.rs / Cargo.toml]
+    B[LLVM IR<br>.ll files]
+    C[SBF Bytecode<br>BPF instructions]
+    D[ELF Module<br>EM_BPF]
+    E[Deployed Program<br>on Solana]
+  end
+
+  A -- rustc frontend --> B
+  B -- LLVM BPF backend --> C
+  C -- pack into ELF --> D
+  D -- solana program deploy --> E
+```
+
+1. **Rust to LLVM IR:** 
+    When you compile a Solana program with Rust, the Rust compiler frontend produces **LLVM Intermediate Representation (IR)**. At this stage, the code is not yet specific to Solana or BPF – it’s a generic SSA-form IR that LLVM’s optimizer can work with. 
+    
+    Any language that can target LLVM’s BPF backend could, in theory, be used to write Solana programs, though Rust is by far the most common choice. If you were to inspect the IR, you’d see function definitions, control flow, and operations in a form that’s close to a simplified assembly language, but not tied to any real machine.
+
+2. **LLVM IR to BPF (SBF) Bytecode:** 
+    Next, LLVM’s **BPF backend** comes into play. Solana uses a custom LLVM backend to generate **SBF** bytecode. SBF stands for *Solana Bytecode Format* – essentially a variant or subset of eBPF tailored for Solana’s runtime. The LLVM backend takes the IR and **lowers it into BPF instructions**. These instructions operate on a register-based virtual machine (with 64-bit registers, like eBPF) rather than an actual CPU like x86 or ARM. 
+    
+    The output of this step is **raw bytecode** following the BPF instruction set. It’s important to note that Solana’s BPF is a *deterministic sandboxed environment*, so certain things that Rust code might do on a normal OS (like using dynamic memory beyond allowed limits, making syscalls, or using unsupported CPU features) are either translated into safe BPF equivalents or rejected at compile time. 
+    
+    For example, if your Rust code tried to use features like threads or large segments of memory, the compilation would either fail or produce warnings for unsupported operations.
+
+3. **Producing the ELF Module:** 
+    The compiled BPF bytecode is packaged into an ELF (Executable and Linkable Format) file — a standard format used for executable binaries. In this case, the ELF acts as a container for the BPF module, similar to a compiled shared object (.so). This ELF file is the artifact that gets deployed on-chain.
+More details about the ELF structure will be covered in a later section.
+
+4. **SBF vs eBPF:** 
+    It’s worth noting that the bytecode produced is not vanilla eBPF as used in Linux, but SBF – Solana’s own flavor. Solana Bytecode Format is a *variation of eBPF* with some different architectural requirements (Solana’s needs diverged from the Linux use-case in a few ways). 
+    
+    For example, Solana’s BPF has a larger allowable program size and uses a different approach to the stack, which we’ll discuss shortly. In practice, the differences mean you should always use Solana’s tools to compile, rather than a generic eBPF assembler. The Solana runtime’s BPF **verifier** will reject programs that don’t conform to the expected format and constraints.
+
+Once Rust compiles to an SBF ELF, it's ready for deployment. The next section delves deeper into what SBF bytecode is and how it differs from standard eBPF.
+
+## What is SBF? (Solana Bytecode Format vs Generic eBPF)
+
+```mermaid
+flowchart LR
+    %% eBPF (Linux)  vs  SBF (Solana)
+    subgraph "eBPF (Linux)"
+        eStack["Stack 512 bytes"]
+        eSize["Verifier cap 4096 instr"]
+        eLoops["Loops must be bounded"]
+        eMem["Memory via maps or packet"]
+        eSys["Fixed helper set"]
+    end
+
+    subgraph "SBF (Solana)"
+        sStack["Stack frames 4 KB each"]
+        sSize["Compute-unit budget"]
+        sLoops["Loops allowed (metered)"]
+        sMem["Virtual map: code, stack, heap, input"]
+        sSys["Runtime syscall table"]
+    end
+
+    eStack -.-> sStack
+    eSize  -.-> sSize
+    eLoops -.-> sLoops
+    eMem   -.-> sMem
+    eSys   -.-> sSys
+```
+
+**eBPF (Extended BPF)**, originally designed for the Linux kernel, defines a sandboxed 64-bit RISC-like instruction set with a fixed number of registers (typically 10 general-purpose registers in the VM, plus a read-only frame pointer register) and a strict execution model. Solana uses this as the foundation for its smart contract engine, but with customizations often referred to collectively as **SBF** or sBPF. Here are the key differences and characteristics:
+
+### Stack Management:
+In Linux eBPF, each eBPF program has a fixed stack of 512 bytes for local storage, and the frame pointer register (R10) is used to access stack slots. SBF significantly expands this. Instead of one flat 512-byte stack, Solana uses **stack frames** of 4KB each. Every time the program calls a function (i.e., a BPF call instruction to another part of its code), a new 4KB frame is allocated for that function’s local variables. 
+    
+This means deep function calls are possible and each can use up to 4096 bytes of stack space, which is far more flexible for typical Rust programs. The trade-off is that Solana had to alter the BPF model to support multiple stack frames and dynamic frame allocation. 
+    
+In SBF, stack frames reside in a **virtual address space** starting at `0x200000000`. The BPF VM maps each 4KB frame into this region as needed. If a program tries to access memory beyond its current frame (e.g., a buffer that doesn’t fit in 4KB), it will either be caught at compile-time (the compiler emits a warning or error for stack overflow) or trigger a runtime **access violation** if it somehow occurs during execution. 
+    
+This design allows Rust programs to use relatively large local arrays and deep recursion which would be impossible under the vanilla eBPF limits.
+
+### Program Size and Instruction Limits:
+Linux eBPF programs are limited in size (the Linux verifier typically caps programs at around 4096 instructions and doesn’t allow loops (Since Linux 5.3, bounded loops are allowed as long as the verifier proves it terminates) unless they can be unrolled, to guarantee termination). Solana’s model does **not impose a static instruction limit** in the same way – instead, Solana uses a dynamic *compute budget* (measured in “compute units”) to ensure programs terminate.
+    
+A Solana transaction by default allows a certain number of BPF instructions to execute (e.g., 200k with a hard ceiling of 1.4 million CU per transaction). Each BPF instruction executed consumes 1 unit of compute budget (more for some heavier operations), and if the budget is exhausted, the program is halted. This means SBF programs can contain loops and dynamic iteration (making them more expressive), relying on the runtime to halt any infinite loops via the compute budget. 
+    
+In contrast, the Linux eBPF verifier would outright reject a program with a potentially unbounded loop. By shifting this responsibility to runtime, Solana’s SBF allows more natural control flow (like `for` and `while` loops in Rust) at the cost of needing runtime checks for execution limits.
+
+### Memory Access and Safety:
+Both eBPF and SBF are designed to be memory-safe within their sandbox. The Solana BPF verifier/loader performs checks to ensure that the program’s **memory accesses are within allowed regions**. Solana predefines a virtual memory map for programs:
+  - Program code is mapped starting at address `0x100000000`.
+  - Stack frames at `0x200000000`.
+  - Heap (dynamic memory allocator region) at `0x300000000`.
+  - Input data (the serialized transaction accounts and instruction data) at `0x400000000`.
+
+  
+  Any pointer dereference in the BPF code is checked to ensure it falls into a region the program has access to. If not, an `AccessViolation` error is triggered, safely terminating the program. This is similar in spirit to the Linux eBPF verifier ensuring all memory accesses are within bounds (e.g., within the stack or packet data), but Solana’s enforcement can happen at runtime as well. For example, a Solana program cannot arbitrarily read or write memory outside the structures given to it (like its input accounts or its own stack/heap), which prevents it from corrupting memory of the runtime or other programs.
+
+### Syscalls and Helpers:
+Solana’s BPF does not allow arbitrary syscalls or function calls to the host environment; it only permits calls to a predefined set of **runtime provided functions** (often called *syscalls* or *BPF helpers*). In Linux eBPF, these are things like helper functions to manipulate packets or maps. 
+    
+In Solana, the syscalls include functions to log messages (`sol_log`), perform sha256 hashing, allocate memory, etc. When your Rust program calls a Solana SDK function like `msg!()` (for logging) or uses `Pubkey::create_program_address`, these ultimately get translated into calls to these runtime functions. Under the hood, the **ELF’s relocation entries** or symbols will mark those as external calls. 
+    
+During deployment or loading, Solana’s BPF loader maps those symbols to actual BPF call numbers or addresses. The SBF VM uses a call instruction with an immediate value that corresponds to an index in a table of approved syscalls. 
+    
+This is set up such that when the BPF VM hits that call, it traps out to the native runtime to execute the operation (after deducting the appropriate compute units cost for the syscall). All such calls are vetted – a program can’t call an arbitrary memory address or host function that’s not in the approved list. This maintains the sandbox.
+
+### Determinism and Limitations:
+Like eBPF, SBF programs must be deterministic. They cannot access random sources of data outside what is passed in (no direct network, time, or random oracle inside the BPF itself) and cannot perform actions that would make different validators get different results. 
+    
+The BPF instruction set has no direct floating-point support (Solana disables FP to avoid nondeterminism and because not needed for typical smart contracts). Also, certain eBPF instructions or features that aren’t relevant to user-level programs may be restricted. 
+
+In summary, **SBF** is Solana’s customized BPF environment that lifts some of eBPF’s restrictive limits (stack size, no loops) while enforcing safety through runtime checks and a limited syscall interface. Now, let’s look at how the compiled program (as an ELF containing SBF bytecode) is loaded and executed by the Solana runtime.
+
+
+## The ELF Format and Solana Program Binaries
+
+When you build a Solana program today, the output is a 64-bit **ELF** tagged for the **SBF** architecture and the modern target triple **`sbf-solana-solana`**. (The legacy `bpfel-unknown-unknown` triple still works, but new tooling and docs have migrated.) Understanding what lives inside this ELF demystifies what actually ends up on-chain.
+
+
+- **ELF Structure**  
+  The file keeps only what the loader needs:
+
+| Section | Purpose | Notes |
+| :-- | :-- | :-- |
+| `.text` | Contains the executable SBF bytecode (program instructions) | Always present. Mapped to virtual memory starting at 0x100000000. This is the main section executed by the Solana VM. |
+| `.rodata` | Stores read-only data like string literals, constant arrays, and other immutable values | Mapped alongside `.text` at 0x100000000. Compiler lifts constant tables here to keep them immutable. |
+| `.data` | Holds initialized mutable global variables | Rarely used because Solana programs are designed to be stateless. Variables here are reset with every invocation. |
+| `.bss` | Allocates space for uninitialized mutable global variables (zero-initialized at runtime) | Presence depends on program design. Solana runtime supports it but usage is limited due to the stateless nature of programs. |
+
+Only the important parts needed for running the program are kept. Function names and a few specific relocation types (like R_BPF_CALL and R_BPF_64_64) stay, because the Solana loader needs them to properly link and run the code. Everything else, like DWARF debug info and extra sections, is removed. This makes the final .so file smaller, which is important because smaller programs are cheaper and faster to deploy on Solana.
+
+- **Entrypoint address**  
+    The Rust macro entrypoint! (or Anchor’s #[program] attribute) writes the start address of your chosen entry function into the ELF header’s `e_entry` field. During execution, the BPF loader reads that field and jumps directly to the entrypoint address. Calling the function `process_instruction` is a common practice, but any function you pass to entrypoint! will work because the loader relies only on the entry address recorded in the header.
+
+- **Relocations and syscalls**  
+
+In Solana programs, external calls like `sol_log` cannot be hardcoded because the actual addresses of runtime services are unknown at compile time. To handle this, the compiler leaves placeholders — relocations — inside the ELF that mark where external calls need to be filled in later.
+When a validator first loads the program, the BPF loader scans these relocations and replaces each one with the corresponding syscall ID that the SBF VM understands. The patched bytecode is then cached in memory, so all future executions use the already-resolved version without needing to reprocess relocations.
+
+- **Verification (before finalization)**  
+On finalize (the last step of deployment), the loader **validates the ELF**. It checks that:
+  - The ELF is well-formed (correct headers, sections, etc).
+  - The program doesn’t exceed size limits or contain malformed instructions.
+  - The relocations are only for allowed symbols (no unresolved calls to random addresses).
+  - The bytecode does not use any forbidden instruction sequences. (For example, certain eBPF instructions might be disallowed if they could cause nondeterminism or safety issues. Also, the code may be scanned to ensure no direct jumps into the middle of instructions and such.)
+  
+  Only if all checks pass does the loader mark the program account as executable. This verification step is akin to the eBPF verifier in Linux, but tailored to Solana’s rules. It’s a crucial security step before untrusted code is run on validators.
+
+- **ELF in account data**  
+  Loader v3 stores the raw ELF blob in the **ProgramData** account. Loader v4 can optionally keep a **zstd-compressed** image to save rent; this is transparent to callers. At execution time the runtime streams only the `.text` bytecode (and a sliver of metadata) into the SBF VM—think of the ELF as a shipping crate, not something mapped and executed natively.
+
+In short, the ELF container moves your SBF bytecode around in a standard format. Once on-chain, the loader verifies the crate, patches syscall relocations, and hands control to the VM at the `e_entry` address. Everything else—memory map (`0x100000000` code, `0x200000000` stack, `0x300000000` heap, `0x400000000` input), compute metering, and optional JIT—happens inside the validator, not inside the ELF itself.
+
+
+## Inside the Solana BPF Virtual Machine (RBPF) and Runtime
+
+Solana’s on-chain programs run inside a **BPF Virtual Machine** (VM) implemented in the Solana runtime. This VM is often referred to as **SBPF** (for “Solana BPF”, the name of the crate that Solana uses for BPF execution). The runtime’s job is to load the program’s bytecode, execute it with the appropriate inputs, and enforce safety and resource limits. Let’s break down the runtime mechanics:
+
+### Loading and Verifying the Program:
+    
+When a transaction calls a program, the Solana runtime (which is processing the transaction on a validator) will load the program’s bytecode from the program account. In practice, Solana validators cache deployed programs in memory after first use to avoid re-reading and re-verifying the ELF every time. 
+    
+If the program was just deployed or changed (upgradeable program scenario), or if it’s being executed for the first time on that validator, the runtime will parse the account data as an ELF, perform the verification (if not already done), and extract the executable bytecode. 
+    
+At this point, the runtime may also initialize the VM with the program’s code. Solana’s runtime supports an **interpreter** for BPF and also a **JIT compiler**. Many validators run the JIT for performance: the BPF bytecode can be translated to native machine code on the fly for faster execution. Whether interpreted or JITed, the semantics are the same (and the implementation is careful to ensure the same results, with the JIT just being an optimized path).
+
+This process—loading, verifying, and (optionally) JIT-compiling the program—is handled in when initializing the `ProgramCacheEntry` struct, which we can see in the `new_internal` within the Agave runtime [agave/program-runtime/src/loaded_programs.rs](https://github.com/anza-xyz/agave/blob/8363752bd5e41aaf8eaf9137711e8d8b11d84be6/program-runtime/src/loaded_programs.rs#L366-L418)
+
+### Memory Mapping in the VM:
+The Solana BPF VM sets up a virtual address space for the program with segmented regions (as mentioned earlier). It maps:
+  - The program’s code into the address space starting at `0x100000000`. This means BPF program counters correspond to addresses in that range. The VM will ensure the program can only execute within this region. There is no writable memory in the code section (self-modifying code is not allowed).
+  - A **stack** region at `0x200000000`. The VM allocates an initial 4KB frame here and sets the frame pointer (register) accordingly. As the program calls functions, new frames (at lower addresses) are allocated. 
+      
+      If the program returns, the frame is freed. Any access outside the current frame is checked – e.g., the VM may check that memory addresses between the frame pointer and frame pointer minus 4096 are the only accessible stack slots.
+  - A **heap** region at `0x300000000` of 32KB by default. Solana programs can use the Rust allocator API (e.g., `Vec::push` will allocate memory). Under the hood, Solana provides a very simple bump allocator that hands out slices of this 32KB heap for the program’s needs. 
+    
+    The heap does not support deallocation (no `free`), which is an intentional simplification to avoid heap management complexity and potential non-determinism. If a program needs more than 32KB heap at runtime, it would run out of memory (or one could implement a custom allocator using the provided region).
+  - The **input data** region at `0x400000000`. Before calling the program’s entrypoint, the loader prepares a contiguous block of memory containing all the input parameters. This includes:
+    - The number of accounts.
+    - For each account: a descriptor (signer/writable/executable flags, and if it’s a duplicate of another account in the list), the account’s pubkey, the account’s owner pubkey, lamports (smallest units of SOL), size of data, the account data itself, and some padding for future growth (notably ~10KB padding for potential `realloc` operations), plus alignment padding to ensure each field is aligned to 8 bytes.
+    - The length of the instruction data and the instruction data bytes.
+    - The program ID (of the program being executed).
+    
+All of this is serialized in little-endian. The loader then places a pointer to this input structure in the appropriate register(s) as arguments to the entrypoint. 
+    
+In C terms, you might imagine the entrypoint signature as something like `entrypoint(const uint8_t *input)` where `input` points to this packed data. In Rust, the Solana SDK abstracts this and hands you a nice `&[AccountInfo]` and `&[u8]` for instruction data, but under the hood it’s reading from this memory region.
+These regions are defined using constants in [sbpf::src/ebpf.rs](https://github.com/anza-xyz/sbpf/blob/56e14672804ae762030e2f620aae6b6e6fa50d34/src/ebpf.rs#L39-L53)
+
+During runtime initialization, the Solana loader uses these addresses to build memory regions inside the VM. The function responsible for this is `create_memory_mapping` in [agave::programs/bpf_loader/src/lib.rs](https://github.com/anza-xyz/agave/blob/0b2d399672cc1fd91d7187093dda80adfcfe12b9/programs/bpf_loader/src/lib.rs#L327-L357C10)
+    
+### Entrypoint Call and Execution:
+
+With memory set up, the VM is ready to start execution. The loader identifies the program’s entrypoint function and sets the BPF instruction pointer to the start of that function. It also sets up the BPF registers according to the **Solana BPF calling convention**:
+  - Typically, register R1 might hold the pointer to the input data (the struct at 0x400000000).
+  - Registers R2, R3, etc., could be used for additional parameters if the entrypoint had multiple (some older conventions passed the input length or so). However, since the entrypoint really only needs the one pointer (everything is in that struct), R1 is the main parameter. The program ID is included at the end of the input data, rather than being a separate argument.
+  - The return value (success or error) will be returned in a register (R0 usually).
+  
+  The loader then hands control to the BPF VM to execute the program instructions.
+
+
+### During Execution – VM Enforcement:
+As the program runs, the BPF VM/enforcer does several things to maintain the sandbox:
+  - It **counts instructions** executed. Each BPF instruction (which could be arithmetic, memory load/store, jump, call, etc.) increments a counter. If the count exceeds the allowed compute budget for this program invocation, the VM will abort execution with an error (essentially a “compute budget exceeded” failure). 
+    
+    This prevents infinite loops or overly long execution. Notably, the VM charges 1 compute unit (CU) per SBF instruction by design. However, syscalls (like sol_log, invoke, etc.) trigger additional CU costs defined by the runtime’s compute budget model — these are not tied to the instruction count but rather debited immediately when the syscall is executed.
+  - It performs **memory access checks**. For example, if the program tries to load from an address in the input region, the VM checks that it’s within the bounds of that region (and possibly that if it corresponds to account data, whether that account was marked as readable). 
+    
+    If a write is attempted to a read-only region (like trying to modify account data that was not marked as writable or, worse, trying to modify the code section), the VM will trap and produce an `AccessViolation`. Similarly, if a pointer is corrupt or goes out of the allocated range, that’s caught.
+  - It handles **syscall invocations**. If the program executes a `CALL` instruction that targets a recognized syscall (as set up in the relocation), the VM will pause the program, switch to native code to execute the syscall, then resume. 
+    
+    For instance, if the program called `sol_log`, the VM will hand off to the host to perform the logging (which might consume a fixed number of compute units defined in the compute budget costs). The results (if any) are returned by setting a register in the BPF context (e.g., some syscalls return values in R0).
+  - The VM prevents dangerous operations. For example, there is no way for the program to escape the VM and run native code arbitrarily – it cannot issue a syscall to exec or open files, etc. It’s locked down to the Solana-defined interface. 
+    
+    The VM enforces strict call depth limits to prevent unbounded recursion. For cross-program invocations (CPI), Solana imposes a maximum depth of 4 levels. For intra-program recursion, the limit is effectively enforced by a fixed 32 KiB stack size, with each stack frame typically consuming 4 KiB, allowing a maximum of around 8 nested calls before triggering a stack overflow.
+
+### Finishing Execution and Writing Back Changes:
+When the program’s entrypoint function returns (either normally or due to an error/panic), control goes back to the loader logic. The return value (Solana programs return a `ProgramResult`, which is basically `Result<(), ProgramError>`) is interpreted. If it’s an error, the runtime will mark the transaction as failed and return the error to the client (and possibly consume the fee or a portion of it). If it’s success, the runtime proceeds.
+
+One crucial step is applying any changes the program made to the account data. Recall that the program was given pointers to each account’s data in the input block. Those were actually pointing to *copied memory* in the VM. When the program writes to an account’s data (for example, updating a token balance in an SPL Token account), it’s writing to the VM’s memory.
+    
+After the program finishes, the runtime will take the mutated data from the VM’s memory and write it back to the actual account data on the blockchain **only for accounts that were marked as writable**. If the program tried to write to a read-only account, either it was blocked or those changes will be discarded (and an error likely already occurred). 
+    
+The runtime also checks that the program did not modify the length of any account data unless it explicitly called the system instruction to reallocate (Solana allows accounts to grow or shrink via a special syscall, but if a program writes past the original data_len of an account without explicitly invoking a reallocation syscall, the runtime will trap or reject the write. Account size changes are only permitted when performed through system-invoked instructions designed for that purpose.
+
+Additionally, the runtime will deduct lamports if the program used more compute than a free limit (via a compute budget fee mechanism) or if it called certain syscalls that have fees (e.g., logging too much might incur a fee). But those are more about fees, not execution correctness.
+
+If the program halts with an error or violation, the runtime rolls back any changes (since on Solana all changes happen in a transactional manner). Account data modifications are applied only upon successful completion. This means if a bug in the program causes a crash (say a panic or an illegal memory access), none of the accounts’ data changes (if any were partially made in memory) will persist. This all-or-nothing behavior is similar to Ethereum’s revert semantics.
+
+So far, we’ve focused on a single program execution. Solana also supports *cross-program invocation* (CPI), where a program calls another program during its execution. We’ll touch on that next, along with the Solana account model, to round out the picture of runtime behavior.
+
+## Account Model, Program Invocation, and Security Checks
+
+Solana’s account model and the ability to invoke programs from within programs add another layer of complexity to execution. Here’s how they work and what security measures are in place:
+
+- **Accounts and Ownership:** 
+    Every account on Solana has an **owner** (which is the program that governs it). For most data accounts, the owner is a program (program account’s Pubkey) that is allowed to modify its contents. 
+    
+    The runtime enforces that **only the owning program can modify an account’s data** (with a few exceptions like the system program for account creation and assignment). During a program invocation, the runtime knows which program is running, and if that program tries to modify an account whose owner is different (and not one of the special exempt cases), it will be prevented. 
+    
+    This is a fundamental security rule: e.g., a Token program cannot arbitrarily change data in a Name Service account, because it’s not the owner of that account.
+
+- **Account Access in Instructions:** 
+    When a transaction or a CPI call is made, it specifies a list of account references that the callee program can access. The program is **blind** to any accounts not passed in. 
+    
+    In fact, within the BPF VM, the only account data that exists in memory is what was provided in the input buffer at `0x400000000`. Thus, a program cannot read or write any account state that wasn’t explicitly given to it as part of the instruction. This prevents a whole class of issues—one program cannot snoop on or tamper with accounts it wasn’t meant to handle.
+
+- **Read-Only vs Writable Accounts:** 
+    The instruction descriptor flags certain accounts as *read-only* or *writable* for that invocation. The Solana runtime uses these flags to mark the memory region for each account accordingly. If an account is read-only, the program will still receive its data, but any attempt to mutate that data should result in an error (AccessViolation) or at least will be discarded if changed. 
+    
+    The VM can enforce this by not mapping the memory as writable. This ensures, for example, if an account holding a user's SOL balance (lamports) is passed as read-only (perhaps just to check a balance), the program cannot accidentally or maliciously decrease that balance because it wasn't given write permission.
+
+- **Program Invocation (CPI):** A program can call another program by invoking the runtime’s CPI mechanism (via a syscall `invoke` or `invoke_signed`). This is analogous to an Ethereum contract calling another contract, but with Solana’s flavor. When program A calls program B:
+  - Program A prepares a new instruction (program B’s id, and a list of accounts to pass). These accounts must be a subset of the accounts A itself has access to (A can only pass along accounts it knows about, possibly with reduced permissions, and it can also include itself or its program id in some cases).
+  - Program A invokes the syscall, which pauses A’s execution and transfers control to the runtime to call B. The runtime essentially sets up a new BPF VM *context* for B, with the accounts and input B was given.
+  - Program B executes under the same compute-unit meter inherited from Program A. Any instruction that B (or deeper CPIs) runs continues to decrement the one counter that was set at the start of the transaction. B cannot see or modify accounts that A didn’t explicitly pass to it. 
+    
+    When B finishes, control returns to A, which can then continue. Any changes B made to accounts (that were writable and owned by B or otherwise allowed) will now be visible to A (since those account data regions in memory have been updated).
+  - Security checks ensure that B cannot exceed A’s privileges. For instance, B cannot suddenly get write access to an account that A had only as read-only (unless A deliberately passed it as writable, which it couldn’t if it wasn’t originally). And if B tries to call back into A or somewhere else creating a cycle, the runtime enforces a hard depth limit of 4 nested CPIs, the 5th attempt triggers a `CallDepth` error and aborts the transaction.
+  - **invoke_signed:** If program A needs to sign for a Program Derived Address (PDA) account when calling B (PDAs are accounts with deterministic addresses derived from seeds and a program id, used commonly for program-owned accounts), A can use `invoke_signed` to present the PDA’s seeds. 
+    
+    The runtime will verify if the PDA’s public key indeed matches those seeds and the calling program’s id. If so, it will **authorize the PDA as a signer** for the duration of the CPI. This mechanism prevents malicious programs from faking signatures: only the program that owns a PDA (and knows the seeds) can use it as a signer in a CPI. B, upon receiving that PDA account, might require a signature (say, if B is the system program trying to debit lamports from that PDA). The runtime’s check via `invoke_signed` is what makes that possible, without any private key.
+  
+- **Concurrency and Parallelism:**
+    Solana’s runtime is designed for parallelism (the *SeaLevel* runtime). Distinct transactions (or CPIs) that operate on disjoint sets of accounts can execute in parallel on different cores. 
+    
+    The BPF VM instances are completely separate in memory and state, so one program running cannot interfere with another running in parallel on a different core, aside from contending for global resources like the scheduler. 
+    
+    This is different from Ethereum, where the single-threaded EVM processes one transaction at a time globally. For security, Solana ensures that no two transactions that write to the same account can run at the same time (that’s why transactions specify account locks). So, while not directly part of the BPF internals, this design influences how the VM is used – it must be reentrant and thread-safe to allow many instances.
+
+- **Runtime Checks Summary:** Summarizing the critical **security checks** Solana performs at runtime:
+  - **Account owner check:** If program X tries to modify account Y’s data, the runtime ensures `Y.owner == X` (or X is explicitly allowed, e.g. system program changing owner).
+  - **Writable check:** If an account wasn’t marked writable in the instruction, the program can’t modify it.
+  - **Bounds check:** Any memory access outside the allocated buffers (account data, stack, heap, input) is trapped.
+  - **Call depth and recursion check:** There’s a limit to CPI depth (to prevent cycles or excessive recursion).
+  - **Compute budget check:** Ensures the program (including any CPIs) doesn’t exceed the allotted instruction count.
+  - **Signature checks:** PDAs or other programmatic signers are verified (`invoke_signed` seeds must match).
+  - **Immutable flag:** If a program account is immutable (upgrade authority removed), the runtime will not allow any deployments or modifications to it, ensuring code can’t change underfoot.
+  
+  All these checks make Solana’s on-chain execution robust against typical attack vectors like buffer overflows, unauthorized state changes, or resource exhaustion – a critical consideration for security researchers auditing Solana programs.
+
+## Comparison with EVM (Ethereum) Execution Model
+
+For those familiar with Ethereum’s EVM, it’s useful to draw analogies and differences to Solana’s SBF execution:
+
+- **Compilation:** 
+    On Ethereum, high-level languages (Solidity, Vyper) compile to EVM bytecode, which is a stack-based bytecode. On Solana, high-level Rust (or C, etc.) compiles to SBF bytecode, which is register-based. Both are ultimately run in a VM on every validating node. 
+    
+    Solana’s choice of BPF (a more general-purpose bytecode) means compiled programs can be more efficient in execution (since BPF is closer to a real CPU architecture than EVM is). However, it also means the binaries are larger (Solana programs can be tens of KB, whereas Ethereum contracts tend to be smaller in bytecode size because of their compact stack machine and high-level opcode design).
+
+- **Instruction Set & Costing:** 
+    The EVM has about 200 opcodes (instructions) designed for high-level operations like SHA3, balance lookup, etc., each with a fixed gas cost. In Solana’s BPF, the instruction set is low-level (load, store, add, multiply, bitwise ops, branch, call). Complex operations in Solana (like hashing) are implemented as syscalls (e.g., calling a SHA256 syscall) rather than single opcodes, but the idea of charging for them is similar (the syscall will consume compute units corresponding to roughly the work done).
+    
+    Both systems have resource metering: EVM uses **gas** (with gas cost per opcode) and halts when gas runs out; Solana uses **compute units** (1 CU per SBF instruction, an additional CU amount when an instruction jumps to a syscall) and halts when the budget is exhausted. One difference is that Solana’s compute budget for a transaction can be increased by the developer (by paying a higher fee or adding a special ComputeBudget instruction), whereas Ethereum’s gas limit per block is fixed and a transaction can only use up to the block’s remaining gas.
+
+- **Memory and Storage:**
+    In EVM, each contract has a persistent storage (key-value store) and a transient memory (cleared each call) and stack (limited to 1024 slots). In Solana, a program has no built-in persistent storage – you use separate accounts as storage. The Solana program’s memory during execution includes stack and heap as described, which is more like a microcomputer’s memory.
+    
+    Solana’s accounts serve the role of persistent storage (like files or database entries) that live outside the program and must be explicitly read/written. This means a Solana developer deals with serialization/deserialization of data into accounts (often using Borsh or similar), analogous to how an Ethereum developer reads/writes contract storage variables. 
+    
+    A key difference: reading/writing an account in Solana has upfront fixed cost (loading the account costs some compute units) but then reading/writing bytes in it via BPF is cheap (just memory operations), whereas in Ethereum, each storage read/write costs significant gas per 32-byte word. This makes Solana more like a traditional computing model once data is loaded, whereas Ethereum’s gas model heavily meters storage access.
+
+- **Parallelism:** 
+    Ethereum processes transactions serially (each transaction’s effects are applied to a global state one at a time). Solana’s architecture (the SeaLevel runtime) allows non-conflicting transactions to run in parallel on multiple cores. 
+    
+    This is invisible to the smart contract code (which is still written as if single-threaded within one invocation), but it means Solana’s runtime is more complex in terms of scheduling. The benefit is higher throughput. 
+    
+    For developers and security researchers, one implication is that you must consider race conditions at a higher level: two transactions could interleave and both succeed if they don’t touch the same accounts, which is fine, but if they do touch the same account, one will wait for the other.
+
+- **Execution Engine:** 
+    The EVM is an interpreter (though projects like Ethereum JIT or eWASM have been explored). Solana’s BPF VM, by contrast, has a powerful JIT option — many Solana nodes JIT compile the BPF to x86 native code for faster execution. This is safe because the code is verified and sandboxed, and it can lead to execution speeds much higher than interpreting EVM bytecode. This partially explains Solana’s ability to handle tens of thousands of instructions per transaction within a 400ms block time and still keep up.
+
+- **Development Experience:** 
+    A Solana developer works with Rust (a systems language) and can use normal paradigms like structs, generics, error handling, etc., which the LLVM->BPF toolchain handles. An Ethereum developer works with a specialized language (Solidity, Vyper) designed around the EVM’s constraints (e.g., 256-bit words, limited stack). 
+    
+    This difference can affect the types of bugs and security issues that appear. For example, buffer overflows are largely mitigated in Solana by Rust’s safety (and BPF’s checks), whereas in EVM, integer overflow was a classic issue (now largely mitigated by Solidity with safe math or built-in checked math). On the other hand, Solana developers must be careful with **explicit memory management** (e.g., account size, manual serialization) and **pointer-like logic** when handling account data, which are less of a concern in Ethereum where storage is abstracted by high-level mappings and such.
+
+In summary, both Solana’s SBF and Ethereum’s EVM serve the same purpose – to safely execute untrusted smart contract code on every node – but they do so with very different designs. SBF is closer to a real hardware CPU in design, benefiting from existing compiler technology (LLVM) and giving developers a more general programming model, whereas EVM is a purpose-built blockchain VM with a simpler model but more intrinsic constraints.
+
+
+## Conclusion
+
+Solana’s runtime is a sophisticated marriage of traditional systems architecture (LLVM, bytecode VM, call frames) with blockchain principles (deterministic execution, account-based state, and concurrency control). For a Solana Rust developer, many of these details are abstracted away by the SDK – you write Rust, and the tooling handles the LLVM compilation and formatting. 
+
+However, understanding what’s happening under the hood is invaluable, especially for security researchers auditing programs or developers optimizing theirs. You gain insight into why certain things (like limiting stack usage or avoiding large loops without reason) are important, and how the Solana runtime keeps your program—and the network—safe.
+
+From the moment you run `cargo build-bpf` to the point a validator executes your program’s bytecode, there’s a complex pipeline ensuring your high-level code is transformed into a safe, efficient, and deterministic form. Solana’s use of BPF (or rather, SBF) is a key enabler of its performance, allowing reuse of a mature compiler infrastructure and a highly optimized VM. At the same time, Solana had to innovate on top of eBPF to meet blockchain needs, resulting in SBF—Solana’s own flavor of bytecode that lifts certain limitations and adds new safety nets.
+
+For those coming from an Ethereum background, the Solana approach offers a different set of challenges and advantages: you get to work in Rust with powerful abstractions, but you also work closer to the metal of a VM and must think in terms of accounts and byte buffers. The deep dive into Solana’s internals reveals a design philosophy focused on maximizing throughput (via parallelism and JIT), while maintaining safety through both compile-time and runtime verification.
+
+In the end, whether you’re writing a simple token program or auditing a complex DeFi protocol on Solana, having a mental model of the *entire journey from Rust code to on-chain execution* will make you a more effective developer and a more discerning security researcher. Solana’s technology under the hood is a fascinating blend of modern compiler tech and blockchain ingenuity—truly taking us from “Rust to SBF” and pushing the frontier of what on-chain programs can do.
+
+## References:
+
+- Solana Documentation: https://solana.com/docs/programs/faq
+- Syndica's blog "Sig Engineering - Part 6 - Progress on the Sig SVM": https://blog.syndica.io/sig-engineering-part-6-progress-on-the-sig-svm
+- Anza's blog "The Solana eBPF Virtual Machine": https://www.anza.xyz/blog/the-solana-ebpf-virtual-machine
+- Solana Compass's Solana Changelog - October 18, 2022: https://www.solanacompass.com/learn/Changelog/solana-changelog-october-18-2022-unified-scheduler-bpf-to-sbf-and-thirdweb-solana
+- Anza's SBPF implementation: https://github.com/anza-xyz/sbpf
+- Solana Labs RBPF implementation: https://github.com/solana-labs/rbpf
+- Agave client implementation: https://github.com/anza-xyz/agave
